@@ -21,7 +21,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # التأكد من أن النص المرسل هو رابط
     if not url.startswith(("http://", "https://")):
-        await update.message.reply_text("❌ من فضلك أرسل رابطاً صحيحاً.")
+        await update.message.reply_text:("❌ من فضلك أرسل رابطاً صحيحاً.")
         return
 
     status_msg = await update.message.reply_text('⏳ جاري التحميل... يرجى الانتظار.')
