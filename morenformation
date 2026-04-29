@@ -1,0 +1,153 @@
+import logging
+import asyncio
+import re
+import tempfile
+import os
+from dotenv import load_dotenv
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters,
+)
+import yt_dlp
+
+load_dotenv()
+# تم وضع التوكن الخاص بكِ هنا
+BOT_TOKEN = "8701970648:AAHWP7Jbj_JawtRZwmQD9bjeAGCYbrMUhbo"
+MAX_FILE_SIZE_MB = 50
+
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+URL_REGEX = re.compile(r"https?://[^\s]+")
+
+def extract_url(text):
+    m = URL_REGEX.search(text)
+    return m.group(0) if m else None
+
+def get_info(url):
+    with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True}) as ydl:
+        return ydl.extract_info(url, download=False)
+
+def download(url, quality, out_dir):
+    if quality == "audio":
+        fmt = "bestaudio/best"
+        post = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}]
+        ext = "mp3"
+    elif quality == "best":
+        fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        post = []; ext = "mp4"
+    else:
+        fmt = f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}]/best"
+        post = []; ext = "mp4"
+
+    opts = {
+        "format": fmt, "outtmpl": os.path.join(out_dir, "%(title).50s.%(ext)s"),
+        "postprocessors": post, "quiet": True, "merge_output_format": "mp4",
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        path = ydl.prepare_filename(info)
+
+    if not os.path.exists(path):
+        path = path.rsplit(".", 1)[0] + "." + ext
+    return path
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 *أهلاً! أنا بوت تحميل الفيديوهات*\n\n"
+        "أرسل رابط أي فيديو من يوتيوب، انستغرام، تيك توك، تويتر، فيسبوك وأكثر!",
+        parse_mode="Markdown"
+    )
+
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = extract_url(update.message.text)
+    if not url:
+        await update.message.reply_text("❌ أرسل رابطاً صحيحاً.")
+        return
+
+    msg = await update.message.reply_text("🔍 جاري جلب المعلومات...")
+    try:
+        info = await asyncio.get_event_loop().run_in_executor(None, get_info, url)
+    except Exception as e:
+        await msg.edit_text(f"❌ خطأ: `{str(e)[:200]}`", parse_mode="Markdown")
+        return
+
+    title = info.get("title", "فيديو")[:60]
+    duration = info.get("duration", 0)
+    d_str = f"{duration//60}:{duration%60:02d}" if duration else "؟"
+    uploader = info.get("uploader", "؟")
+
+    context.user_data["url"] = url
+    context.user_data["title"] = title
+
+    kb = [
+        [InlineKeyboardButton("🎬 أفضل جودة", callback_data="q_best"),
+         InlineKeyboardButton("📺 720p", callback_data="q_720")],
+        [InlineKeyboardButton("📱 480p", callback_data="q_480"),
+         InlineKeyboardButton("💾 360p", callback_data="q_360")],
+        [InlineKeyboardButton("🎵 صوت MP3", callback_data="q_audio")],
+    ]
+    await msg.edit_text(
+        f"📹 *{title}*\n👤 {uploader}\n⏱ {d_str}\n\nاختر الجودة:",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
+
+QUALITIES = {
+    "q_best": ("best", "أفضل جودة"),
+    "q_720":  ("720",  "720p"),
+    "q_480":  ("480",  "480p"),
+    "q_360":  ("360",  "360p"),
+    "q_audio":("audio","صوت MP3"),
+}
+
+async def handle_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    quality, label = QUALITIES.get(query.data, (None, None))
+    if not quality:
+        return
+
+    url = context.user_data.get("url")
+    title = context.user_data.get("title", "فيديو")
+    if not url:
+        await query.edit_message_text("❌ انتهت الجلسة، أرسل الرابط مجدداً.")
+        return
+
+    await query.edit_message_text(f"⬇️ جاري التحميل ({label})...")
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = await asyncio.get_event_loop().run_in_executor(
+                None, download, url, quality, tmpdir
+            )
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+            if size_mb > MAX_FILE_SIZE_MB:
+                await query.edit_message_text(
+                    f"⚠️ الملف كبير ({size_mb:.1f} MB)، جرّب جودة أقل."
+                )
+                return
+
+            await query.edit_message_text("📤 جاري الرفع...")
+            with open(path, "rb") as f:
+                if quality == "audio":
+                    await query.message.reply_audio(audio=f, title=title)
+                else:
+                    await query.message.reply_video(video=f, caption=f"📹 {title} ✅ {label}", supports_streaming=True)
+
+        await query.edit_message_text("✅ تم!")
+    except Exception as e:
+        await query.edit_message_text(f"❌ فشل: `{str(e)[:300]}`", parse_mode="Markdown")
+
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    app.add_handler(CallbackQueryHandler(handle_quality, pattern=r"^q_"))
+    logger.info("🤖 البوت يعمل...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
